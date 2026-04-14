@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+openai-key.txt
+outputs/
+vocab_analysis_results.json

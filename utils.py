@@ -7,6 +7,176 @@ NUM_LOGPROBS = {
     'top_prob': 1,
 }
 
+
+
+
+def blend_distributions(base_logprobs, nudging_logprobs, alpha=0.5):
+    """
+    Blend two probability distributions.
+    
+    Args:
+        base_logprobs: dict {token: logprob} from base model
+        nudging_logprobs: dict {token: logprob} from nudging model
+        alpha: float in [0,1], weight for nudging (0=base only, 1=nudging only)
+    
+    Returns:
+        dict {token: blended_logprob}
+    """
+    import numpy as np
+    
+    # Convert logprobs to probs
+    base_probs = {k: np.exp(v) for k, v in base_logprobs.items()}
+    nudging_probs = {k: np.exp(v) for k, v in nudging_logprobs.items()}
+    
+    # Get all tokens from both distributions
+    all_tokens = set(base_probs.keys()) | set(nudging_probs.keys())
+    
+    # Blend probabilities
+    blended_probs = {}
+    for token in all_tokens:
+        base_p = base_probs.get(token, 0.0)
+        nudging_p = nudging_probs.get(token, 0.0)
+        blended_probs[token] = alpha * nudging_p + (1 - alpha) * base_p
+    
+    # Normalize (should already be normalized, but ensure)
+    total = sum(blended_probs.values())
+    if total > 0:
+        blended_probs = {k: v/total for k, v in blended_probs.items()}
+    
+    # Convert back to logprobs
+    blended_logprobs = {k: np.log(v + 1e-10) for k, v in blended_probs.items()}
+    
+    return blended_logprobs
+
+def sample_from_logprobs(logprobs, temperature=0.0):
+    """
+    Sample token from logprob distribution.
+    
+    Args:
+        logprobs: dict {token: logprob}
+        temperature: float, 0.0 for greedy (deterministic)
+    
+    Returns:
+        sampled token (str)
+    """
+    import numpy as np
+    
+    if temperature == 0.0:
+        # Greedy: return token with highest logprob
+        return max(logprobs.items(), key=lambda x: x[1])[0]
+    else:
+        # Sample with temperature
+        tokens = list(logprobs.keys())
+        logprobs_array = np.array([logprobs[t] for t in tokens])
+        
+        # Apply temperature
+        logprobs_array = logprobs_array / temperature
+        
+        # Convert to probabilities
+        probs = np.exp(logprobs_array)
+        probs = probs / np.sum(probs)
+        
+        # Sample
+        sampled_idx = np.random.choice(len(tokens), p=probs)
+        return tokens[sampled_idx]
+
+def compute_blend_alpha_old(base_logprobs, nudging_logprobs, base_uncertain_threshold=0.3):
+    """
+    Compute blend weight alpha based on base model's uncertainty.
+    
+    Higher alpha = trust nudging more
+    Lower alpha = trust base more
+    
+    Args:
+        base_logprobs: dict {token: logprob} from base
+        nudging_logprobs: dict {token: logprob} from nudging  
+        base_uncertain_threshold: threshold for base uncertainty
+    
+    Returns:
+        alpha: float in [0, 1]
+    """
+    import numpy as np
+    
+    # Get base model's max probability
+    base_probs = {k: np.exp(v) for k, v in base_logprobs.items()}
+    base_max_prob = max(base_probs.values())
+    
+    # Compute alpha based on base uncertainty
+    if base_max_prob < base_uncertain_threshold:
+        # Base very uncertain → trust nudging more
+        alpha = 0.7
+    elif base_max_prob < base_uncertain_threshold + 0.2:
+        # Base moderately uncertain → moderate blend
+        alpha = 0.5
+    else:
+        # Base confident → trust base more
+        alpha = 0.3
+    
+    return alpha
+
+
+def compute_blend_alpha_noextreme(base_logprobs, nudging_logprobs, tau=0.4):
+    import numpy as np
+    
+    base_probs = {k: np.exp(v) for k, v in base_logprobs.items()}
+    nudging_probs = {k: np.exp(v) for k, v in nudging_logprobs.items()}
+    
+    base_max_prob = max(base_probs.values())
+    nudging_max_prob = max(nudging_probs.values())
+    
+    nudging_top = max(nudging_probs, key=nudging_probs.get)
+    agreement = base_probs.get(nudging_top, 0.0)
+    
+    # Continuous: high when base uncertain AND nudging confident AND agree
+    base_uncertainty = 1 - base_max_prob
+    alpha_raw = base_uncertainty * nudging_max_prob * (1 + agreement)
+    
+    # Scale to [0.1, 0.8]
+    alpha = 0.1 + alpha_raw * 0.7
+    return float(np.clip(alpha, 0.1, 0.9))
+
+def compute_blend_alpha_biased(base_logprobs, nudging_logprobs, tau=0.4):
+    import numpy as np
+    
+    base_probs = {k: np.exp(v) for k, v in base_logprobs.items()}
+    nudging_probs = {k: np.exp(v) for k, v in nudging_logprobs.items()}
+    
+    base_max_prob = max(base_probs.values())
+    nudging_max_prob = max(nudging_probs.values())
+    
+    nudging_top = max(nudging_probs, key=nudging_probs.get)
+    agreement = base_probs.get(nudging_top, 0.0)
+    
+    # Natural range: all signals in [0,1], product in [0,2]
+    base_uncertainty = 1 - base_max_prob
+    alpha = base_uncertainty * nudging_max_prob * (1 + agreement)
+    
+    # Clip to (0,1) only for validity
+    return float(np.clip(alpha, 0.0, 1.0))
+
+
+def compute_blend_alpha(base_logprobs, nudging_logprobs, tau=0.4):
+    base_probs = {k: np.exp(v) for k, v in base_logprobs.items()}
+    nudging_probs = {k: np.exp(v) for k, v in nudging_logprobs.items()}
+    
+    base_max_prob = max(base_probs.values())
+    nudging_max_prob = max(nudging_probs.values())
+    
+    # Base alpha from relative confidence - naturally ∈ [0,1]
+    alpha = nudging_max_prob / (base_max_prob + nudging_max_prob)
+    
+    # Agreement bonus: if nudging's top token appears in base distribution
+    nudging_top = max(nudging_probs, key=nudging_probs.get)
+    agreement = base_probs.get(nudging_top, 0.0)
+    
+    # Small agreement bonus, keep bounded
+    # Max bonus = 0.1 when agreement = 1.0
+    alpha = alpha + 0.1 * agreement
+    
+    return float(np.clip(alpha, 0.0, 1.0))
+
+
+
 def apply_instruct_template(model_name, system_prompt, instruct_prompt, response_prompt, add_bos=False):
     model_name = model_name.lower()
 
@@ -142,7 +312,7 @@ def complete_with_base(nudging_method='top_prob',
         "num_logprobs": NUM_LOGPROBS[nudging_method],
     }
     next_nudging_info = EMPTY_INFO_DICT     # for nudging methods that compute nudging info during base completion, we can save the info for the next round, currently not used for top_prob nudging
-    while len(encoding.encode(completion_base)) < max_completion_token and not found_nudging_token:
+    while len(encoding.encode(completion_base, disallowed_special=())) < max_completion_token and not found_nudging_token:
        
         if current_base_info["completion"] == "":
             # complete the sentence using the base model
@@ -229,6 +399,17 @@ def completion_with_nudging(
         nudging_method='top_prob',
         top_prob_thres=0.3,
         top_p=0.9,
+
+        max_intervention_rate=1.0,  # ← ADD THIS (1.0 = disabled, 0.15 = 15% cap)
+        agreement_top_k=5,                   # ← ADD: Check top-k tokens
+        enable_agreement_filter=False,       # ← ADD: Enable/disable filter
+
+        min_nudging_confidence=0.0,
+
+        enable_distribution_blending=False,    # ← NEW
+        blend_alpha=0.5,                       # ← NEW (or 'auto' for adaptive)
+
+        verify_overlap=False
         ):
     if client_base is None:
         client_base = client
@@ -245,177 +426,675 @@ def completion_with_nudging(
         'top_prob': top_prob_thres,
     }
 
+
+    # ========== ADD THESE LINES ==========
+    # Intervention rate tracking
+    total_tokens_generated = 0
+    intervention_count = 0
+    intervention_capped = False
+
+    # Agreement filter tracking
+    rejected_nudging_count = 0
+    accepted_nudging_count = 0
+    # =====================================
+
+
     output = ""
-    nudging_round = 0
-    all_nudging_words = []
-    all_nudging_and_completions = []
-    current_nudging_info = {
-        "completion": "",
-        "tokens": [],
-        "top_logprobs": [],
-        "stop_reason": None,
-        "num_logprobs": NUM_LOGPROBS[nudging_method],
-    }
+
+
+    token_count = 0
+    intervention_count = 0
+    blended_token_count = 0
+    
     stop_reason = None
-    repeat_nudging_word = 0
-    last_nudging_word = ""
-    while len(encoding.encode(output)) < max_token_total and nudging_round < max_round:    # use the number of gpt-3.5 token to approximately control the length
-        nudging_round += 1
-        if current_nudging_info["completion"] == "":
-            response = client_nudging.completions.create(
-                model=nudging_model,
-                prompt=full_prefix_nudging + output,
-                max_tokens=completion_token_num_nudging,
-                temperature=nudging_temperature,
-                logprobs=current_nudging_info["num_logprobs"],
+
+
+
+
+    # ===================================================================
+    # BLENDING APPROACH: Token-by-token generation with distribution blending
+    # ===================================================================
+    
+    if enable_distribution_blending:
+        overlap_stats = []  # ← ADD THIS at start of blending loop
+        while len(encoding.encode(output, disallowed_special=())) < max_token_total: #and token_count < max_round:
+            token_count += 1
+            
+            # Get base model's distribution
+            response_base = client_base.completions.create(
+                model=base_model,
+                prompt=full_prefix_base + output,
+                max_tokens=1,
+                temperature=base_temperature,
+                logprobs=100,  # Get full distribution (API max is usually 5-100)
+                top_p=top_p,
+            )
+            base_logprobs = response_base.choices[0].logprobs.top_logprobs[0]
+            base_top_token = response_base.choices[0].logprobs.tokens[0]
+            
+            # Check if base is uncertain
+            base_probs = {k: np.exp(v) for k, v in base_logprobs.items()}
+            base_max_prob = max(base_probs.values())
+            base_uncertain = base_max_prob < top_prob_thres
+            
+            if base_uncertain:
+                # Base uncertain → get nudging distribution and blend
+                intervention_count += 1
+                
+                response_nudging = client_nudging.completions.create(
+                    model=nudging_model,
+                    prompt=full_prefix_nudging + output,
+                    max_tokens=1,
+                    temperature=nudging_temperature,
+                    logprobs=100,
                 )
-            current_nudging_info["completion"] = response.choices[0].text
-            current_nudging_info["tokens"] = response.choices[0].logprobs.tokens
-            current_nudging_info["top_logprobs"] = response.choices[0].logprobs.top_logprobs
-            current_nudging_info["stop_reason"] = response.choices[0].finish_reason
+                nudging_logprobs = response_nudging.choices[0].logprobs.top_logprobs[0]
+                
+                # DEBUG: Check if flag is set
+                #print(f"[DEBUG] verify_overlap={verify_overlap}, intervention_count={intervention_count}")
+                # ========== ADD DEBUG CODE HERE ==========
+                # Check token overlap (only print on first intervention for each sample)
+                #if verify_overlap:
+                #    common_tokens = set(base_logprobs.keys()) & set(nudging_logprobs.keys())
+                #    print(f"[OVERLAP CHECK] Common tokens: {len(common_tokens)}/{len(base_logprobs)} base, {len(common_tokens)}/{len(nudging_logprobs)} nudging")
+                #    print(f"[OVERLAP CHECK] Sample base tokens: {list(base_logprobs.keys())[:5]}")
+                #    print(f"[OVERLAP CHECK] Sample nudging tokens: {list(nudging_logprobs.keys())[:5]}")
+                # ==========================================
+                # ========== ADD OVERLAP TRACKING ==========
+                if verify_overlap:
+                    common_tokens = set(base_logprobs.keys()) & set(nudging_logprobs.keys())
+                    overlap_stats.append({
+                        'position': token_count,
+                        'base_tokens': len(base_logprobs),
+                        'nudging_tokens': len(nudging_logprobs),
+                        'common_tokens': len(common_tokens),
+                        'overlap_pct': 100 * len(common_tokens) / len(base_logprobs),
+                    })
+                # ==========================================
 
-        # if finish_reason is stop, break the loop, also handles nudging completion from previous round
-        if current_nudging_info["stop_reason"] == "stop":
-            stop_reason = "nudging_model_stop"
-            if len(current_nudging_info["completion"]) > 0:
-                all_nudging_words.append(current_nudging_info["completion"])
-                all_nudging_and_completions.append(current_nudging_info["completion"])
-                output += current_nudging_info["completion"]
-            break
 
-        # ===================================================================
-        # Stage 1: use base model to find the first token that violates the nudging criteria (no need to nudge)
-        # ===================================================================
-        found_acc_token = False
-        current_base_info = {   # will be passed to the next stage
+
+                # Compute blend weight (adaptive or fixed)
+                if blend_alpha == 'auto':
+                    alpha = compute_blend_alpha(base_logprobs, nudging_logprobs, top_prob_thres)
+                else:
+                    alpha = blend_alpha
+                
+                # Blend distributions
+                blended_logprobs = blend_distributions(base_logprobs, nudging_logprobs, alpha)
+                
+                # Sample from blended distribution
+                next_token = sample_from_logprobs(blended_logprobs, temperature=0.0)  # Greedy
+                blended_token_count += 1
+                
+                if print_intermediate_output:
+                    nudging_top = max(nudging_logprobs.items(), key=lambda x: x[1])[0]
+                    print(f"[BLEND α={alpha:.2f}] Base: '{base_top_token}' ({base_max_prob:.3f}), "
+                          f"Nudging: '{nudging_top}', Selected: '{next_token}'")
+            else:
+                # Base confident → use base only
+                next_token = base_top_token
+                
+                if print_intermediate_output:
+                    print(f"[BASE] Token: '{next_token}' (prob={base_max_prob:.3f})")
+            
+            # Add token to output
+            output += next_token
+            
+            # Check for stop
+            if response_base.choices[0].finish_reason == "stop":
+                stop_reason = "base_model_stop"
+                break
+        
+        if token_count >= max_round and not stop_reason:
+            stop_reason = "round"
+        if len(encoding.encode(output, disallowed_special=())) >= max_token_total and not stop_reason:
+            stop_reason = "length"
+        
+        all_info = {
+            "question": question,
+            "context": context,
+            "raw_answer": output,
+            "all_nudging_words": [],  # Not applicable for blending
+            "all_completions": [output],
+            "stop_reason": stop_reason,
+            "system_prompt_base": system_prompt_base,
+            "system_prompt_nudging": system_prompt_nudging,
+            "full_prefix_base": full_prefix_base,
+            "full_prefix_nudging": full_prefix_nudging,
+            "intervention_count": intervention_count,
+            "blended_token_count": blended_token_count,
+            "total_tokens": token_count,
+            "intervention_rate": intervention_count / max(token_count, 1),
+
+            "overlap_stats": overlap_stats if verify_overlap else [],  # ← ADD THIS
+
+        }
+        
+        return all_info
+    
+    # ===================================================================
+    # ORIGINAL NUDGING APPROACH (if blending disabled)
+    # ===================================================================
+
+    else:
+
+
+        nudging_round = 0
+        all_nudging_words = []
+        all_nudging_and_completions = []
+        current_nudging_info = {
             "completion": "",
             "tokens": [],
             "top_logprobs": [],
+            "stop_reason": None,
             "num_logprobs": NUM_LOGPROBS[nudging_method],
         }
-        nudging_text = current_nudging_info["completion"]
-        num_whitespaces = len(nudging_text) - len(nudging_text.lstrip(" "))
-        space_prefix = " " * num_whitespaces
-        current_nudging_words = nudging_text.lstrip(" ").split(" ")     # token leads to some unexpected behaviors, still use nudging word
-        nudging_word_id = 0 if len(current_nudging_words) > 1 else 1    # if only one word, always accept the word and go to the next round: it won't go into the loop and found_acc_token will be False
-        while not found_acc_token and nudging_word_id < len(current_nudging_words) - 1:
-            nudging_word_id += 1                # always accept the first word
-            nudging_gen_prefix = space_prefix + " ".join(current_nudging_words[:nudging_word_id])
-            current_nudging_word = " " + current_nudging_words[nudging_word_id]  # add a leading space to the current nudging word since the nudging words a split by space
-            if current_nudging_word == " ":     # skip the multiple space
-                continue
-            prefix = full_prefix_base + output + nudging_gen_prefix
-            response = client_base.completions.create(
-                model=base_model,
-                prompt=prefix,
-                max_tokens=completion_token_num,
-                temperature=base_temperature,
-                logprobs=current_base_info["num_logprobs"],
-                top_p=top_p,
-                )
-            current_base_info["tokens"] = response.choices[0].logprobs.tokens
-            current_base_info["top_logprobs"] = response.choices[0].logprobs.top_logprobs
-            current_base_info["completion"] = response.choices[0].text
+        stop_reason = None
+        repeat_nudging_word = 0
+        last_nudging_word = ""
+        while len(encoding.encode(output, disallowed_special=())) < max_token_total and nudging_round < max_round:    # use the number of gpt-3.5 token to approximately control the length
+            nudging_round += 1
+            if current_nudging_info["completion"] == "":
+                response = client_nudging.completions.create(
+                    model=nudging_model,
+                    prompt=full_prefix_nudging + output,
+                    max_tokens=completion_token_num_nudging,
+                    temperature=nudging_temperature,
+                    logprobs=current_nudging_info["num_logprobs"],
+                    )
+                current_nudging_info["completion"] = response.choices[0].text
+                current_nudging_info["tokens"] = response.choices[0].logprobs.tokens
+                current_nudging_info["top_logprobs"] = response.choices[0].logprobs.top_logprobs
+                current_nudging_info["stop_reason"] = response.choices[0].finish_reason
 
-            # look for the first token that meets the nudging criteria
-            first_base_token = current_base_info["tokens"][0]            
-            if current_nudging_word.startswith(first_base_token): # check if the current nudging word is the same or starts with the first base token
-                found_acc_token = True
-            else: 
-                found_acc_token = not check_need_nudging(nudging_method,    # check if the token violates the nudging criteria (no need to nudge)
-                                                         base_token_id=0,
-                                                         current_base_info=current_base_info, 
-                                                         thresholds=thresholds)
-                
-        # here we have either prefix_idx == len(current_nudging_info["tokens"]):    if no token meets the nudging criteria, use the current nudging completion
-        # or found_acc_token == True:    if a token violates the nudging criteria, we use the prefix as nudging tokens
-        
-        nudging_words = space_prefix +  " ".join(current_nudging_words[:nudging_word_id])
-        
-        # Heuristic: if the nudging words are the same as the last one for three rounds, break the loop
-        if nudging_words == last_nudging_word:
-            repeat_nudging_word += 1
-            if repeat_nudging_word >= 3:
-                stop_reason = "repeated_nudging_words"
+            # if finish_reason is stop, break the loop, also handles nudging completion from previous round
+            if current_nudging_info["stop_reason"] == "stop":
+                stop_reason = "nudging_model_stop"
+                if len(current_nudging_info["completion"]) > 0:
+                    all_nudging_words.append(current_nudging_info["completion"])
+                    all_nudging_and_completions.append(current_nudging_info["completion"])
+                    output += current_nudging_info["completion"]
                 break
-        else:
-            last_nudging_word = nudging_words
-            repeat_nudging_word = 0
-        all_nudging_words.append(nudging_words)
-        output += nudging_words
 
-        if not found_acc_token: # if no base token can be accepted, use the current nudging completion and go to the next round
-            all_nudging_and_completions.append(nudging_words)
-            # reset the current nudging info and continue to the next round
-            current_nudging_info = {
+
+            # ========== ADD THESE LINES ==========
+            # Check if intervention budget exceeded
+            current_rate = intervention_count / total_tokens_generated if total_tokens_generated > 20 else 0
+            skip_nudging_this_round = (current_rate >= max_intervention_rate) and (total_tokens_generated > 20)
+            
+
+            # ========== ADD THESE LINES ==========
+            # If intervention budget exceeded, skip nudging and use base model only
+            if skip_nudging_this_round:
+                #print(f"[CAP TRIGGERED] Round {nudging_round}")
+                intervention_capped = True
+                # Just use base model completion without nudging guidance
+                response = client_base.completions.create(
+                    model=base_model,
+                    prompt=full_prefix_base + output,
+                    max_tokens=completion_token_num,
+                    temperature=base_temperature,
+                    top_p=top_p,
+                )
+                base_completion = response.choices[0].text
+                output += base_completion
+                total_tokens_generated += len(response.choices[0].logprobs.tokens) if response.choices[0].logprobs else 1
+                
+                # Reset nudging info for next round
+                current_nudging_info = {
+                    "completion": "",
+                    "tokens": [],
+                    "top_logprobs": [],
+                    "stop_reason": None,
+                    "num_logprobs": NUM_LOGPROBS[nudging_method],
+                }
+                continue
+            # =====================================
+
+
+
+
+
+            # ===================================================================
+            # Stage 1: use base model to find the first token that violates the nudging criteria (no need to nudge)
+            # ===================================================================
+            found_acc_token = False
+            current_base_info = {   # will be passed to the next stage
                 "completion": "",
                 "tokens": [],
-                "logprobs": [],
-                "stop_reason": None,
+                "top_logprobs": [],
                 "num_logprobs": NUM_LOGPROBS[nudging_method],
             }
-            continue
-        if current_base_info["completion"] == "":   # the base model thinks the completion is done, go to the next round. Make sure current_base_info["completion"] is not empty if proceed to the next stage
-            all_nudging_and_completions.append(nudging_words)
-            current_nudging_info = {
-                "completion": "",
-                "tokens": [],
-                "logprobs": [],
-                "stop_reason": None,
-                "num_logprobs": NUM_LOGPROBS[nudging_method],
-            }
-            continue
+            nudging_text = current_nudging_info["completion"]
+            num_whitespaces = len(nudging_text) - len(nudging_text.lstrip(" "))
+            space_prefix = " " * num_whitespaces
+            current_nudging_words = nudging_text.lstrip(" ").split(" ")     # token leads to some unexpected behaviors, still use nudging word
+            nudging_word_id = 0 if len(current_nudging_words) > 1 else 1    # if only one word, always accept the word and go to the next round: it won't go into the loop and found_acc_token will be False
+            while not found_acc_token and nudging_word_id < len(current_nudging_words) - 1:
+                nudging_word_id += 1                # always accept the first word
+                nudging_gen_prefix = space_prefix + " ".join(current_nudging_words[:nudging_word_id])
+                current_nudging_word = " " + current_nudging_words[nudging_word_id]  # add a leading space to the current nudging word since the nudging words a split by space
+                if current_nudging_word == " ":     # skip the multiple space
+                    continue
+                prefix = full_prefix_base + output + nudging_gen_prefix
+                response = client_base.completions.create(
+                    model=base_model,
+                    prompt=prefix,
+                    max_tokens=completion_token_num,
+                    temperature=base_temperature,
+                    logprobs=current_base_info["num_logprobs"],
+                    top_p=top_p,
+                    )
+                current_base_info["tokens"] = response.choices[0].logprobs.tokens
+                current_base_info["top_logprobs"] = response.choices[0].logprobs.top_logprobs
+                current_base_info["completion"] = response.choices[0].text
 
-        # ===================================================================
-        # Stage 2: use nudging model to find the first token that meets the nudging criteria (need to nudge)
-        # ===================================================================
-        max_completion_token = max_token_total - len(encoding.encode(output))
-        completion_base, completion_base_all, current_nudging_info = complete_with_base(nudging_method=nudging_method,
-                                                                                        base_model=base_model,
-                                                                                        full_prefix_base=full_prefix_base,
-                                                                                        output=output,
-                                                                                        current_base_info=current_base_info,
-                                                                                        max_completion_token=max_completion_token,
-                                                                                        completion_token_num=completion_token_num,
-                                                                                        client_base=client_base,
-                                                                                        thresholds=thresholds,
-                                                                                        temperature=base_temperature,
-                                                                                        top_p=top_p,
-                                                                                        )
-        # print(f"next_nudging_info: {current_nudging_info}") # debug
+                # look for the first token that meets the nudging criteria
+                first_base_token = current_base_info["tokens"][0]            
+                if current_nudging_word.startswith(first_base_token): # check if the current nudging word is the same or starts with the first base token
+                    found_acc_token = True
+                else: 
+                    found_acc_token = not check_need_nudging(nudging_method,    # check if the token violates the nudging criteria (no need to nudge)
+                                                            base_token_id=0,
+                                                            current_base_info=current_base_info, 
+                                                            thresholds=thresholds)
+                    
+            # here we have either prefix_idx == len(current_nudging_info["tokens"]):    if no token meets the nudging criteria, use the current nudging completion
+            # or found_acc_token == True:    if a token violates the nudging criteria, we use the prefix as nudging tokens
+            
+            nudging_words = space_prefix +  " ".join(current_nudging_words[:nudging_word_id])
+            
 
-        output += completion_base
-        all_nudging_and_completions.append(nudging_words + completion_base) # the generated tokens in each round, concating all completion would be the final output
+
+#            # ========== AGREEMENT FILTER START ==========
+#            if enable_agreement_filter and len(nudging_words.strip()) > 0:
+#                # Get base model's top-k preferences at current position
+#                check_prefix = full_prefix_base + output
+#                response_check = client_base.completions.create(
+#                    model=base_model,
+#                    prompt=check_prefix,
+#                    max_tokens=1,
+#                    temperature=base_temperature,
+#                    logprobs=agreement_top_k,
+#                    top_p=top_p,
+#                )
+                
+#                base_top_logprobs = response_check.choices[0].logprobs.top_logprobs[0]
+#                base_top_tokens = [t.strip() for t in base_top_logprobs.keys()]
+                
+                # Get first word of nudging suggestion
+#                first_nudging_word = nudging_words.strip().split()[0] if nudging_words.strip() else ""
+                
+                # Check if nudging aligns with any of base model's top-k choices
+#                nudging_agrees = False
+#                for base_token in base_top_tokens:
+#                    if (first_nudging_word.startswith(base_token) or 
+#                        base_token.startswith(first_nudging_word) or
+#                        first_nudging_word == base_token):
+#                        nudging_agrees = True
+#                        break
+                
+#                if not nudging_agrees:
+                    # Base model strongly disagrees - reject this nudging
+#                    rejected_nudging_count += 1
+#                    if print_intermediate_output:
+#                        print(f"[REJECTED] Nudging '{first_nudging_word}' not in base top-{agreement_top_k}: {base_top_tokens}")
+                    
+                    # Reset and skip to next round
+#                    current_nudging_info = {
+#                        "completion": "",
+#                        "tokens": [],
+#                        "logprobs": [],
+#                        "stop_reason": None,
+#                        "num_logprobs": NUM_LOGPROBS[nudging_method],
+#                    }
+#                    continue
+#                else:
+#                    accepted_nudging_count += 1
+            # ========== AGREEMENT FILTER END ==========
+
+
+
+    # ========== DUAL FILTER: Agreement + Confidence ==========
+    #        if enable_agreement_filter and len(nudging_words.strip()) > 0:
+    #            # Get base model's top-k preferences at current position
+    #            check_prefix = full_prefix_base + output
+    #            response_check = client_base.completions.create(
+    #                model=base_model,
+    #                prompt=check_prefix,
+    #                max_tokens=1,
+    #                temperature=base_temperature,
+    #                logprobs=agreement_top_k,
+    #                top_p=top_p,
+    #            )
+                
+    #            base_top_logprobs = response_check.choices[0].logprobs.top_logprobs[0]
+    #            base_top_tokens = [t.strip() for t in base_top_logprobs.keys()]
+                
+                # ========== NEW: Get nudging model's confidence ==========
+    #            if min_nudging_confidence > 0.0:
+                    # Query nudging model for its confidence at current position
+    #                response_nudging = client_nudging.completions.create(
+    #                    model=nudging_model,
+    #                    prompt=full_prefix_nudging + output,
+    #                    max_tokens=1,
+    #                    temperature=nudging_temperature,
+    #                    logprobs=1,  # Just need top-1 for confidence
+    #                )
+    #               nudging_logprobs = response_nudging.choices[0].logprobs.top_logprobs[0]
+                    
+                    # Get confidence for nudging's suggestion
+    #                first_nudging_word = nudging_words.strip().split()[0]
+                    
+                    # Find the token in nudging's distribution
+    #                nudging_confidence = 0.0
+    #                for token, logprob in nudging_logprobs.items():
+    #                    if (first_nudging_word.startswith(token.strip()) or 
+    #                        token.strip().startswith(first_nudging_word) or
+    #                        first_nudging_word == token.strip()):
+    #                        nudging_confidence = np.exp(logprob)
+    #                        break
+    #            else:
+    #                nudging_confidence = 1.0  # Confidence check disabled
+                # ========================================================
+                
+                # Get first word of nudging suggestion
+    #            first_nudging_word = nudging_words.strip().split()[0] if nudging_words.strip() else ""
+                
+                # ========== DUAL FILTER CHECK ==========
+                # Check 1: Agreement
+    #            nudging_agrees = False
+    #            for base_token in base_top_tokens:
+    #                if (first_nudging_word.startswith(base_token) or 
+    #                    base_token.startswith(first_nudging_word) or
+    #                    first_nudging_word == base_token):
+    #                    nudging_agrees = True
+    #                    break
+                
+                # Check 2: Confidence
+    #            nudging_confident = nudging_confidence >= min_nudging_confidence
+                
+                # Decision: BOTH conditions must be satisfied
+    #            if not (nudging_agrees and nudging_confident):
+                    # Reject: Base model strongly disagrees OR nudging uncertain
+    #                rejected_nudging_count += 1
+    #                if print_intermediate_output:
+    #                    print(f"[REJECTED] Word: '{first_nudging_word}', "
+    #                          f"Agreement: {nudging_agrees}, "
+    #                          f"Confidence: {nudging_confidence:.3f}, "
+    #                          f"Base top-{agreement_top_k}: {base_top_tokens}")
+                    
+                    # Reset and skip to next round
+    #                current_nudging_info = {
+    #                    "completion": "",
+    #                    "tokens": [],
+    #                    "logprobs": [],
+    #                    "stop_reason": None,
+    #                    "num_logprobs": NUM_LOGPROBS[nudging_method],
+    #                }
+    #                continue
+    #            else:
+    #                accepted_nudging_count += 1
+    #                if print_intermediate_output:
+    #                    print(f"[ACCEPTED] Word: '{first_nudging_word}', "
+    #                          f"Confidence: {nudging_confidence:.3f}")
+            # ========== END DUAL FILTER ==========
+
+    # ========== CONFIDENCE COMPETITION ==========
+            if enable_agreement_filter and len(nudging_words.strip()) > 0:
+                # Get base model's top-k preferences at current position
+                check_prefix = full_prefix_base + output
+                response_check = client_base.completions.create(
+                    model=base_model,
+                    prompt=check_prefix,
+                    max_tokens=1,
+                    temperature=base_temperature,
+                    logprobs=agreement_top_k,  # Get top-k for agreement check
+                    top_p=top_p,
+                )
+                
+                base_top_logprobs = response_check.choices[0].logprobs.top_logprobs[0]
+                base_top_tokens = [t.strip() for t in base_top_logprobs.keys()]  # ← DEFINE THIS
+                
+                # Get first word of nudging suggestion
+                first_nudging_word = nudging_words.strip().split()[0] if nudging_words.strip() else ""
+                
+                # Check 1: Agreement (safety gate)
+                nudging_agrees = False
+                for base_token in base_top_tokens:
+                    if (first_nudging_word.startswith(base_token) or 
+                        base_token.startswith(first_nudging_word) or
+                        first_nudging_word == base_token):
+                        nudging_agrees = True
+                        break
+                
+                if not nudging_agrees:
+                    # Safety: reject incoherent suggestions
+                    rejected_nudging_count += 1
+                    if print_intermediate_output:
+                        print(f"[REJECTED - INCOHERENT] Word: '{first_nudging_word}', Base top-{agreement_top_k}: {base_top_tokens}")
+                    
+                    current_nudging_info = {
+                        "completion": "",
+                        "tokens": [],
+                        "logprobs": [],
+                        "stop_reason": None,
+                        "num_logprobs": NUM_LOGPROBS[nudging_method],
+                    }
+                    continue
+                
+                # Check 2: Confidence competition
+                # Get base's confidence for its top choice
+                base_confidence = np.exp(list(base_top_logprobs.values())[0])
+                
+                # Get nudging's confidence at current position
+                response_nudging = client_nudging.completions.create(
+                    model=nudging_model,
+                    prompt=full_prefix_nudging + output,
+                    max_tokens=1,
+                    temperature=nudging_temperature,
+                    logprobs=5,  # Get top-5 to find our token
+                )
+                nudging_top_logprobs = response_nudging.choices[0].logprobs.top_logprobs[0]
+                
+                # Find nudging's confidence for its suggested token
+                nudging_confidence = 0.0
+                for token, logprob in nudging_top_logprobs.items():
+                    if (first_nudging_word.startswith(token.strip()) or 
+                        token.strip().startswith(first_nudging_word) or
+                        first_nudging_word == token.strip()):
+                        nudging_confidence = np.exp(logprob)
+                        break
+                
+                # If we didn't find the token in top-5, get more logprobs
+                if nudging_confidence == 0.0:
+                    response_nudging_full = client_nudging.completions.create(
+                        model=nudging_model,
+                        prompt=full_prefix_nudging + output,
+                        max_tokens=1,
+                        temperature=nudging_temperature,
+                        logprobs=20,  # Get more tokens
+                    )
+                    nudging_full_logprobs = response_nudging_full.choices[0].logprobs.top_logprobs[0]
+                    for token, logprob in nudging_full_logprobs.items():
+                        if (first_nudging_word.startswith(token.strip()) or 
+                            token.strip().startswith(first_nudging_word) or
+                            first_nudging_word == token.strip()):
+                            nudging_confidence = np.exp(logprob)
+                            break
+                
+                # Competition: choose more confident
+                if nudging_confidence > base_confidence:
+                    # Nudging wins - more confident
+                    accepted_nudging_count += 1
+                    if print_intermediate_output:
+                        print(f"[ACCEPTED - MORE CONFIDENT] Nudging: {nudging_confidence:.3f} > Base: {base_confidence:.3f}")
+                    # Continue with nudging words (don't break)
+                else:
+                    # Base wins - more confident or equal
+                    rejected_nudging_count += 1
+                    if print_intermediate_output:
+                        print(f"[REJECTED - LESS CONFIDENT] Nudging: {nudging_confidence:.3f} <= Base: {base_confidence:.3f}")
+                    
+                    # Reset and skip to next round (use base)
+                    current_nudging_info = {
+                        "completion": "",
+                        "tokens": [],
+                        "logprobs": [],
+                        "stop_reason": None,
+                        "num_logprobs": NUM_LOGPROBS[nudging_method],
+                    }
+                    continue
+            # ========== END CONFIDENCE COMPETITION ==========
+
+
+#            # ===== CONFIDENCE THRESHOLD =====
+#            if min_nudging_confidence > 0.0 and len(nudging_words.strip()) > 0:
+#                response_nudging_conf = client_nudging.completions.create(
+#                    model=nudging_model,
+#                    prompt=full_prefix_nudging + output,
+#                    max_tokens=1,
+#                    temperature=nudging_temperature,
+#                    logprobs=1,
+#                )
+#                nudging_top_logprobs = response_nudging_conf.choices[0].logprobs.top_logprobs[0]
+#                first_nudging_word = nudging_words.strip().split()[0] if nudging_words.strip() else ""
+#                
+#                nudging_confidence = 0.0
+#                for token, logprob in nudging_top_logprobs.items():
+#                    if (first_nudging_word.startswith(token.strip()) or
+#                        token.strip().startswith(first_nudging_word) or
+#                        first_nudging_word == token.strip()):
+#                        nudging_confidence = np.exp(logprob)
+#                        break
+                
+#                if nudging_confidence < min_nudging_confidence:
+#                    rejected_nudging_count += 1
+#                    if print_intermediate_output:
+#                        print(f"[REJECTED] Nudging confidence {nudging_confidence:.3f} < threshold {min_nudging_confidence:.3f}")
+#                    current_nudging_info = {
+#                        "completion": "",
+#                        "tokens": [],
+#                        "top_logprobs": [],
+#                        "stop_reason": None,
+#                        "num_logprobs": NUM_LOGPROBS[nudging_method],
+#                    }
+#                    continue
+            # ================================
+
+
+            # Heuristic: if the nudging words are the same as the last one for three rounds, break the loop
+            if nudging_words == last_nudging_word:
+                repeat_nudging_word += 1
+                if repeat_nudging_word >= 3:
+                    stop_reason = "repeated_nudging_words"
+                    break
+            else:
+                last_nudging_word = nudging_words
+                repeat_nudging_word = 0
+            all_nudging_words.append(nudging_words)
+            output += nudging_words
+
+
+            # ========== ADD THIS LINE ==========
+            intervention_count += 1  # Count this as an intervention
+            # ===================================
+
+
+
+            if not found_acc_token: # if no base token can be accepted, use the current nudging completion and go to the next round
+                all_nudging_and_completions.append(nudging_words)
+                # reset the current nudging info and continue to the next round
+                current_nudging_info = {
+                    "completion": "",
+                    "tokens": [],
+                    "logprobs": [],
+                    "stop_reason": None,
+                    "num_logprobs": NUM_LOGPROBS[nudging_method],
+                }
+                continue
+            if current_base_info["completion"] == "":   # the base model thinks the completion is done, go to the next round. Make sure current_base_info["completion"] is not empty if proceed to the next stage
+                all_nudging_and_completions.append(nudging_words)
+                current_nudging_info = {
+                    "completion": "",
+                    "tokens": [],
+                    "logprobs": [],
+                    "stop_reason": None,
+                    "num_logprobs": NUM_LOGPROBS[nudging_method],
+                }
+                continue
+
+            # ===================================================================
+            # Stage 2: use nudging model to find the first token that meets the nudging criteria (need to nudge)
+            # ===================================================================
+            max_completion_token = max_token_total - len(encoding.encode(output, disallowed_special=()))
+            completion_base, completion_base_all, current_nudging_info = complete_with_base(nudging_method=nudging_method,
+                                                                                            base_model=base_model,
+                                                                                            full_prefix_base=full_prefix_base,
+                                                                                            output=output,
+                                                                                            current_base_info=current_base_info,
+                                                                                            max_completion_token=max_completion_token,
+                                                                                            completion_token_num=completion_token_num,
+                                                                                            client_base=client_base,
+                                                                                            thresholds=thresholds,
+                                                                                            temperature=base_temperature,
+                                                                                            top_p=top_p,
+                                                                                            )
+            # print(f"next_nudging_info: {current_nudging_info}") # debug
+
+            output += completion_base
+            all_nudging_and_completions.append(nudging_words + completion_base) # the generated tokens in each round, concating all completion would be the final output
+
+
+            # ========== ADD THIS LINE ==========
+            total_tokens_generated += len(encoding.encode(completion_base, disallowed_special=()))
+            # ===================================
+
+
+            if print_intermediate_output:
+                print(f"************nudging round {nudging_round}************")
+                print(f"****nudging words from {nudging_model}****: {nudging_words}")
+                print(f"****nudging text****: {nudging_text}")
+                print(f"****completion from {base_model}****: {completion_base}")
+                print(f"****all completion from {base_model}****: {completion_base_all}")
+                print(f"****output****: {output}")
+        
+        if nudging_round >= max_round and not stop_reason:
+            stop_reason = "round"
+        if len(encoding.encode(output, disallowed_special=())) >= max_token_total and not stop_reason:
+            stop_reason = "length"
+        output = remove_redundant_repetitions(output)
         if print_intermediate_output:
-            print(f"************nudging round {nudging_round}************")
-            print(f"****nudging words from {nudging_model}****: {nudging_words}")
-            print(f"****nudging text****: {nudging_text}")
-            print(f"****completion from {base_model}****: {completion_base}")
-            print(f"****all completion from {base_model}****: {completion_base_all}")
+            print(f"************final output************")
             print(f"****output****: {output}")
-    
-    if nudging_round >= max_round and not stop_reason:
-        stop_reason = "round"
-    if len(encoding.encode(output)) >= max_token_total and not stop_reason:
-        stop_reason = "length"
-    output = remove_redundant_repetitions(output)
-    if print_intermediate_output:
-        print(f"************final output************")
-        print(f"****output****: {output}")
 
-    all_info = {
-        "question": question,
-        "context": context,
-        "raw_answer": output,
-        "all_nudging_words": all_nudging_words,
-        "all_completions": all_nudging_and_completions,
-        "stop_reason": stop_reason,
-        "system_prompt_base": system_prompt_base,
-        "system_prompt_nudging": system_prompt_nudging,
-        "full_prefix_base": full_prefix_base,
-        "full_prefix_nudging": full_prefix_nudging,
-    }
-    return all_info
+        all_info = {
+            "question": question,
+            "context": context,
+            "raw_answer": output,
+            "all_nudging_words": all_nudging_words,
+            "all_completions": all_nudging_and_completions,
+            "stop_reason": stop_reason,
+            "system_prompt_base": system_prompt_base,
+            "system_prompt_nudging": system_prompt_nudging,
+            "full_prefix_base": full_prefix_base,
+            "full_prefix_nudging": full_prefix_nudging,
+
+
+            # ========== ADD THESE LINES ==========
+            "intervention_rate": intervention_count / total_tokens_generated if total_tokens_generated > 0 else 0,
+            "intervention_count": intervention_count,
+            "total_tokens_generated": total_tokens_generated,
+            "intervention_capped": intervention_capped,
+            "rejected_nudging_count": rejected_nudging_count,
+            "accepted_nudging_count": accepted_nudging_count,
+            "agreement_filter_enabled": enable_agreement_filter,
+            # =====================================
+
+
+        }
+        return all_info
 
 ############################################################################################################
 # Baseline completion
@@ -433,7 +1112,7 @@ def completion_baseline_ensemble(
         logprobs=5,
         ):
     output = ''
-    while len(encoding.encode(output)) < max_token_total:
+    while len(encoding.encode(output, disallowed_special=())) < max_token_total:
         response_base = client_base.completions.create(
             model=base_model,
             prompt=full_prefix_base + output,
@@ -505,7 +1184,7 @@ def completion_baseline_proxy_tuning(
         logprobs=100,
         ):
     output = ''
-    while len(encoding.encode(output)) < max_token_total:
+    while len(encoding.encode(output, disallowed_special=())) < max_token_total:
         response_base = client_base.completions.create(
             model=base_model,
             prompt=full_prefix_base + output,
