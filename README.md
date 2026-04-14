@@ -1,4 +1,4 @@
-# BlendIn (BASED): Distribution-Blending Inference-Time Alignment
+# BlendIn: Distribution-Blending Inference-Time Alignment
 
 ## Setup
 
