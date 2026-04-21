@@ -1,4 +1,19 @@
-# BlendIn: Distribution-Blending Inference-Time Alignment
+# BlendIn: Inference-Time Alignment via Distribution Blending
+
+This is the official implementation of **To Intervene or Not: Guiding Inference-time Alignment with Probabilistic
+Model Blending**, accepted at **ACL 2026**.
+
+If you find our work useful, please cite our paper:
+```
+@inproceedings{blendin2026,
+    title     = {To Intervene or Not: Guiding Inference-time Alignment with Probabilistic
+Model Blending},
+    author    = {Jin Gan, Xin Li∗, Jun Luo},
+    booktitle = {Proceedings of the 64th Annual Meeting of the Association for Computational Linguistics},
+    year      = {2026}
+}
+```
+Thank you. Wish you the best. :)
 
 ## Setup
 
